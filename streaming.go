@@ -21,11 +21,18 @@ type Metadata struct {
 	ColumnNames []string `json:"column_names"`
 }
 
-type Req struct {
+type ReqStreaming struct {
 	ExecutionID string    `json:"execution_id"`
 	Metadata    Metadata  `json:"metadata"`
 	Z           int       `json:"z"`
 	Rows        io.Reader `json:"-"`
+}
+
+type ReqRaw struct {
+	ExecutionID string          `json:"execution_id"`
+	Metadata    Metadata        `json:"metadata"`
+	Z           int             `json:"z"`
+	Rows        json.RawMessage `json:"rows"`
 }
 
 type ReqBatch struct {
@@ -38,7 +45,7 @@ type ReqBatch struct {
 type Row map[string]any
 
 func GetData(ctx context.Context, s3 *s3.S3) (io.Reader, error) {
-	s3Reader, err := s3.ReaderFromS3Location(ctx, "data.json.zst")
+	s3Reader, err := s3.ReaderFromS3Location(ctx, "data-new.json.zst")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get S3 reader: %w", err)
 	}
@@ -50,7 +57,7 @@ func GetData(ctx context.Context, s3 *s3.S3) (io.Reader, error) {
 	return reader, nil
 }
 
-func SerializeReqToJson(req Req, writer io.Writer) error {
+func SerializeReqStreamingToJson(req ReqStreaming, writer io.Writer) error {
 	buf, err := json.Marshal(req)
 	if err != nil {
 		return err
@@ -80,7 +87,7 @@ func getZSTReader(stream io.Reader) (io.Reader, error) {
 	return zstd.NewReader(
 		stream,
 		zstd.WithDecoderConcurrency(0),
-		zstd.WithDecoderMaxMemory(512*1024*1024),
+		zstd.WithDecoderMaxMemory(32*1024*1024),
 	)
 }
 
@@ -117,7 +124,7 @@ func decodeJSON(rows []Row, stream io.Reader) error {
 }
 
 func ParseStreaming(reader io.Reader, c *gin.Context) error {
-	req := Req{
+	req := ReqStreaming{
 		ExecutionID: "123",
 		Metadata: Metadata{
 			QueryID:     1,
@@ -129,7 +136,43 @@ func ParseStreaming(reader io.Reader, c *gin.Context) error {
 
 	// serialize req to stdout
 	c.Writer.WriteHeader(200)
-	return SerializeReqToJson(req, c.Writer)
+	return SerializeReqStreamingToJson(req, c.Writer)
+}
+
+func ParseRaw(reader io.Reader, c *gin.Context) error {
+	rows := make([]byte, 431287686)
+	offset := 0
+	for {
+		n, err := reader.Read(rows[offset:])
+		offset += n
+		if n == 0 {
+			break
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+	}
+	req := ReqRaw{
+		ExecutionID: "123",
+		Metadata: Metadata{
+			QueryID:     1,
+			ColumnNames: []string{"a", "b"},
+		},
+		Z:    1,
+		Rows: rows,
+	}
+
+	// serialize req to stdout
+	buf, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	c.Writer.WriteHeader(200)
+	_, err = c.Writer.Write(buf)
+	return err
 }
 
 func ParseBatch(reader io.Reader, c *gin.Context) error {
@@ -182,6 +225,23 @@ func main() {
 		err = ParseStreaming(reader, c)
 		if err != nil {
 			log.Fatal("failed to serialize json: ", err)
+		}
+		var memstats runtime.MemStats
+		runtime.ReadMemStats(&memstats)
+		log.Print("sys: ", memstats.Sys/1024/1024, "MB")
+	})
+	r.GET("/raw", func(c *gin.Context) {
+		reader, err := GetData(c.Request.Context(), s3)
+		if err != nil {
+			log.Fatal("failed to get data: ", err)
+			c.AbortWithStatus(500)
+			return
+		}
+		err = ParseRaw(reader, c)
+		if err != nil {
+			log.Fatal("failed to serialize json: ", err)
+			c.AbortWithStatus(500)
+			return
 		}
 		var memstats runtime.MemStats
 		runtime.ReadMemStats(&memstats)
